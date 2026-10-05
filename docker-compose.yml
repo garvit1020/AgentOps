@@ -1,0 +1,191 @@
+version: '3.9'
+
+# ============================================================
+# AgentOps - Full Local Development Stack
+# Run: docker-compose up -d
+# ============================================================
+
+networks:
+  agentops-network:
+    driver: bridge
+
+volumes:
+  agentops-db:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+
+services:
+
+  # ─────────────────────────────────────────────
+  # Frontend - React.js Dashboard (Port 3000)
+  # ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: agentops-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:5000
+      - VITE_WS_URL=http://localhost:5000
+    depends_on:
+      - backend
+    networks:
+      - agentops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Backend - Node.js + Express + Socket.io (Port 5000)
+  # ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agentops-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - AGENT_SERVER_URL=http://agents:8000
+      - FRONTEND_URL=http://localhost:3000
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - PROMETHEUS_URL=http://prometheus:9090
+      - DB_PATH=/data/agentops.db
+      - DEMO_MODE=${DEMO_MODE:-true}
+    volumes:
+      - agentops-db:/data
+    depends_on:
+      - agents
+    networks:
+      - agentops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Python AI Agents - FastAPI (Port 8000)
+  # ─────────────────────────────────────────────
+  agents:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    container_name: agentops-agents
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.1-70b-versatile}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_REPO=${GITHUB_REPO:-garvit1020/AgentOps}
+      - DOCKERHUB_USERNAME=${DOCKERHUB_USERNAME}
+      - DOCKERHUB_PASSWORD=${DOCKERHUB_PASSWORD}
+      - PROMETHEUS_URL=http://prometheus:9090
+      - LOKI_URL=http://loki:3100
+      - BACKEND_URL=http://backend:5000
+      - DEMO_MODE=${DEMO_MODE:-true}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - agentops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Prometheus - Metrics (Port 9090)
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: agentops-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    networks:
+      - agentops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Grafana - Dashboards (Port 3001)
+  # ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: agentops-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=agentops123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_DOMAIN=localhost
+      - GF_FEATURE_TOGGLES_ENABLE=publicDashboards
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - agentops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Loki - Log Aggregation (Port 3100)
+  # ─────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: agentops-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki/loki-config.yaml:/etc/loki/local-config.yaml
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - agentops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Promtail - Log Shipper to Loki
+  # ─────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:3.2.1
+    container_name: agentops-promtail
+    volumes:
+      - ./monitoring/loki/promtail-config.yaml:/etc/promtail/config.yml
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - agentops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Demo App - Sample Deployed Application (Port 8080)
+  # ─────────────────────────────────────────────
+  demo-app:
+    build:
+      context: ./infrastructure/docker
+      dockerfile: Dockerfile
+    container_name: agentops-demo-app
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_NAME=AgentOps Demo App
+      - VERSION=1.0.0
+    networks:
+      - agentops-network
+    restart: unless-stopped
+    labels:
+      - "prometheus.scrape=true"
+      - "prometheus.port=8080"
+      - "prometheus.path=/metrics"

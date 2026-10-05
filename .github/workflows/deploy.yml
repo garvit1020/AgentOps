@@ -1,0 +1,119 @@
+name: AgentOps — Kubernetes Deploy
+
+on:
+  workflow_run:
+    workflows: ["AgentOps — Docker Build & Push"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy target environment'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    environment: ${{ github.event.inputs.environment || 'production' }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name agentops-cluster
+
+      - name: Create AgentOps Secrets in K8s
+        run: |
+          kubectl create secret generic agentops-secrets \
+            --from-literal=GROQ_API_KEY=${{ secrets.GROQ_API_KEY }} \
+            --from-literal=GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            --from-literal=GITHUB_WEBHOOK_SECRET=${{ secrets.GITHUB_WEBHOOK_SECRET }} \
+            --from-literal=DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }} \
+            --from-literal=DOCKERHUB_PASSWORD=${{ secrets.DOCKERHUB_PASSWORD }} \
+            --namespace agentops \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply Kubernetes Namespace
+        run: kubectl apply -f infrastructure/kubernetes/namespace.yaml
+
+      - name: Update Image Tags in Manifests
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          sed -i "s|agentops-demo-app:latest|${{ secrets.DOCKERHUB_USERNAME }}/agentops-demo-app:${IMAGE_TAG}|g" infrastructure/kubernetes/deployment.yaml
+          sed -i "s|agentops-backend:latest|${{ secrets.DOCKERHUB_USERNAME }}/agentops-backend:${IMAGE_TAG}|g" infrastructure/kubernetes/deployment.yaml
+          sed -i "s|agentops-agents:latest|${{ secrets.DOCKERHUB_USERNAME }}/agentops-agents:${IMAGE_TAG}|g" infrastructure/kubernetes/deployment.yaml
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f infrastructure/kubernetes/deployment.yaml
+          kubectl apply -f infrastructure/kubernetes/service.yaml
+          kubectl apply -f infrastructure/kubernetes/ingress.yaml
+
+      - name: Wait for Rollout
+        run: |
+          kubectl rollout status deployment/agentops-demo-app -n agentops --timeout=300s
+          kubectl rollout status deployment/agentops-backend -n agentops --timeout=300s
+          kubectl rollout status deployment/agentops-agents -n agentops --timeout=300s
+
+      - name: Verify Deployment Health
+        run: |
+          echo "=== Pod Status ==="
+          kubectl get pods -n agentops
+          echo ""
+          echo "=== Service Status ==="
+          kubectl get services -n agentops
+          echo ""
+          echo "=== Deployment Status ==="
+          kubectl get deployments -n agentops
+
+      - name: Notify AgentOps Platform — Deploy Complete
+        if: success()
+        run: |
+          curl -X POST "${{ secrets.AGENTOPS_WEBHOOK_URL }}/api/webhook/github" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "event": "k8s_deploy_complete",
+              "repo": "${{ github.repository }}",
+              "branch": "main",
+              "commit": "${{ github.sha }}",
+              "environment": "${{ github.event.inputs.environment || \"production\" }}",
+              "status": "success"
+            }' || echo "Webhook not available"
+
+      - name: Notify AgentOps Platform — Deploy Failed
+        if: failure()
+        run: |
+          curl -X POST "${{ secrets.AGENTOPS_WEBHOOK_URL }}/api/webhook/github" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "event": "k8s_deploy_failed",
+              "repo": "${{ github.repository }}",
+              "commit": "${{ github.sha }}",
+              "status": "failed"
+            }' || echo "Webhook not available"
+
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "Deployment failed — rolling back..."
+          kubectl rollout undo deployment/agentops-demo-app -n agentops || true
+          kubectl rollout undo deployment/agentops-backend -n agentops || true
+          kubectl rollout undo deployment/agentops-agents -n agentops || true
+          echo "Rollback complete"

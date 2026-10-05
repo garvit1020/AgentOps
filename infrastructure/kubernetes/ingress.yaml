@@ -1,0 +1,53 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agentops-ingress
+  namespace: agentops
+  labels:
+    app: agentops
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "3600"
+    nginx.ingress.kubernetes.io/websocket-services: "agentops-backend"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: agentops.local
+      http:
+        paths:
+          # Frontend dashboard
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agentops-frontend-lb
+                port:
+                  number: 80
+          # Backend API + WebSocket
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: agentops-backend
+                port:
+                  number: 5000
+          - path: /socket.io
+            pathType: Prefix
+            backend:
+              service:
+                name: agentops-backend
+                port:
+                  number: 5000
+          # Python Agent API
+          - path: /agents-api
+            pathType: Prefix
+            backend:
+              service:
+                name: agentops-agents
+                port:
+                  number: 8000
